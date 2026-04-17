@@ -915,12 +915,9 @@ class BlockMask:
         self.BLOCK_SIZE = BLOCK_SIZE
         self.mask_mod = mask_mod
 
-        if _blocks_are_contiguous is None:
-            if not torch.compiler.is_compiling():
-                _blocks_are_contiguous = _are_blocks_contiguous(self)
-            else:
-                _blocks_are_contiguous = False
-        self._blocks_are_contiguous = _blocks_are_contiguous
+        self._blocks_are_contiguous = (
+            _blocks_are_contiguous if _blocks_are_contiguous is not None else False
+        )
 
     @classmethod
     def from_kv_blocks(
@@ -984,7 +981,7 @@ class BlockMask:
             kv_length = kv_indices.shape[-1] * BLOCK_SIZE[1]
             seq_lengths = (q_length, kv_length)
 
-        return cls(
+        instance = cls(
             seq_lengths=seq_lengths,
             kv_num_blocks=kv_num_blocks,
             kv_indices=kv_indices,
@@ -997,6 +994,8 @@ class BlockMask:
             BLOCK_SIZE=BLOCK_SIZE,
             mask_mod=mask_mod,
         )
+        instance._blocks_are_contiguous = _are_blocks_contiguous(instance)
+        return instance
 
     @overload
     def as_tuple(
@@ -1726,10 +1725,7 @@ def _are_blocks_contiguous(block_mask: BlockMask) -> bool:
         block_mask.full_kv_indices is not None
         and block_mask.full_kv_num_blocks is not None
     ):
-        if not _check_indices(
-            block_mask.full_kv_indices, block_mask.full_kv_num_blocks
-        ):
-            return False
+        return _check_indices(block_mask.full_kv_indices, block_mask.full_kv_num_blocks)
     return True
 
 

@@ -6138,9 +6138,12 @@ class TestBlockMask(InductorTestCase):
 
         _, code = run_and_get_code(
             torch.compile(flex_attention, fullgraph=True),
-            q, k, v, block_mask=bm,
+            q,
+            k,
+            v,
+            block_mask=bm,
         )
-        self.assertIn("'BLOCKS_ARE_CONTIGUOUS': True", str(code))
+        self.assertIn("BLOCKS_ARE_CONTIGUOUS : tl.constexpr = True", str(code))
 
     @supported_platform
     @common_utils.parametrize("BLOCK_SIZE", [32, 64, 128, 256, (32, 64), (64, 32)])
