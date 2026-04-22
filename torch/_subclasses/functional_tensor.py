@@ -231,11 +231,16 @@ class FunctionalTensor(torch.Tensor):
                 # Otherwise this would be invalid.
                 mode._storage_to_base[out.elem.untyped_storage()] = out
             else:
-                out._inference_mode_base = mode._storage_to_base[
-                    out.elem.untyped_storage()
-                ]
-                if out._inference_mode_base is None:
-                    raise AssertionError("out._inference_mode_base must not be None")
+                storage = out.elem.untyped_storage()
+                base = mode._storage_to_base.get(storage)
+                if base is None:
+                    # Base tensor was created outside inference_mode (e.g. a
+                    # graph input wrapped before inference_mode was entered).
+                    # Treat this view as a new base for tracking purposes.
+                    mode._storage_to_base[storage] = out
+                    out._inference_mode_base = None
+                else:
+                    out._inference_mode_base = base
         return out
 
     def __torch_dispatch__(  # type: ignore[override]
@@ -464,6 +469,33 @@ class FunctionalTensorMode(TorchDispatchMode):
 
         if _has_unrecognized_tensor_types(types):
             return NotImplemented
+
+        # C++ functionalization cannot operate on inference tensors because
+        # they lack a version counter.  Temporarily exit inference mode for
+        # the whole dispatch so that tensors created by decomposition and by
+        # the C++ Functionalize kernel are normal tensors.  This is safe
+        # because functionalization only runs during compilation, where
+        # inference_mode semantics (version-counter elision, inference-tensor
+        # tagging) are not needed — the real inference_mode is applied at
+        # runtime by the graph nodes emitted by Dynamo.
+        _inference_mode_ctx = None
+        if torch.is_inference_mode_enabled():
+            _inference_mode_ctx = torch.autograd.grad_mode._enter_inference_mode(
+                False
+            )
+        try:
+            return self._torch_dispatch_impl(func, types, args, kwargs)
+        finally:
+            if _inference_mode_ctx is not None:
+                torch.autograd.grad_mode._exit_inference_mode(_inference_mode_ctx)
+
+    def _torch_dispatch_impl(
+        self,
+        func: OpOverload,
+        types: Sequence[type],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
 
         if (
             func not in FunctionalTensor.metadata_fns
