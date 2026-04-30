@@ -2733,6 +2733,7 @@ class TestFSDPDivergentRanks(FSDPTest):
         model = SomeUnusedParamModel(use_sometimes=self.rank == 0).to(device)
         cloned_param_list = [p.clone() for p in model.parameters()]
         fully_shard(model)
+        model.set_reduce_scatter_unused_params(True)
 
         x = torch.randn(2, 8, device=device)
 
@@ -2777,6 +2778,7 @@ class TestFSDPDivergentRanks(FSDPTest):
 
         model = SomeUnusedParamModel(use_sometimes=True).to(device)
         fully_shard(model)
+        model.set_reduce_scatter_unused_params(True)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
         x = torch.randn(2, 8, device=device)
@@ -2828,6 +2830,7 @@ class TestFSDPDivergentRanks(FSDPTest):
         # Rank 0 uses sometimes_used, rank 1 does not
         model = SomeUnusedParamModel(use_sometimes=self.rank == 0).to(device)
         fully_shard(model)
+        model.set_reduce_scatter_unused_params(True)
 
         x = torch.randn(2, 8, device=device)
         loss = model(x).sum()
