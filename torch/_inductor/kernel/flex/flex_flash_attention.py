@@ -69,7 +69,7 @@ def ensure_flash_available() -> bool:
     in the same interpreter to retry the import.
     """
     try:
-        return importlib.util.find_spec("flash_attn.cute") is not None  # type: ignore[attr-defined]
+        return importlib.util.find_spec("flash_attn.cute") is not None
     except ImportError:
         return False
 
@@ -452,7 +452,7 @@ def create_flex_flash_attention_kernel(
             7: create_indices_fake,
         }
 
-    template_output = autotune_select_algorithm(
+    template_output, _ = autotune_select_algorithm(
         "flex_flash_attention",
         choices,
         input_nodes,
@@ -677,7 +677,7 @@ def create_flex_flash_attention_backward_kernel(
             11: create_indices_fake,
         }
 
-    template_output = autotune_select_algorithm(
+    template_output, _ = autotune_select_algorithm(
         "flex_flash_attention_backward",
         choices,
         input_nodes,
