@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 import dataclasses
 import functools
+import json
 import os
 import platform
 import re
@@ -18,6 +19,82 @@ from torch._inductor.utils import python_subprocess_env
 _IS_WINDOWS = sys.platform == "win32"
 
 
+def _prepend_path_to_env(env: dict[str, str], env_var: str, path: str) -> None:
+    existing = env.get(env_var)
+    paths = existing.split(os.pathsep) if existing else []
+    env[env_var] = os.pathsep.join([path, *(p for p in paths if p != path)])
+
+
+def _cuda_dependency_names(cuda_libs: list[tuple[str, str]]) -> list[str]:
+    return [lib_name.split(".", 1)[0] for _, lib_name in cuda_libs]
+
+
+def _first_cuda_dependency_path(
+    lib_folder: str,
+    lib_name: str,
+    get_cuda_dep_paths: Callable[[str, str, str], list[str]],
+) -> str | None:
+    for path in sys.path:
+        candidate_lib_paths = get_cuda_dep_paths(path, lib_folder, lib_name)
+        if candidate_lib_paths:
+            return candidate_lib_paths[0]
+
+    return None
+
+
+def _isa_dry_run_cuda_dependency_paths() -> tuple[list[str], list[str]]:
+    if not sys.platform.startswith("linux") or torch.version.cuda is None:
+        return [], []
+
+    from torch import (
+        _CUDA_DEPENDENCY_LIBS as cuda_dependency_libs,
+        _CUDA_OPTIONAL_DEPENDENCY_LIBS as cuda_optional_dependency_libs,
+        _get_cuda_dep_paths as get_cuda_dep_paths,
+    )
+
+    cuda_dependency_paths = []
+    for lib_folder, lib_name in [
+        *cuda_dependency_libs,
+        *cuda_optional_dependency_libs,
+    ]:
+        cuda_dependency_path = _first_cuda_dependency_path(
+            lib_folder, lib_name, get_cuda_dep_paths
+        )
+        if cuda_dependency_path is not None:
+            cuda_dependency_paths.append(cuda_dependency_path)
+
+    return cuda_dependency_paths, _cuda_dependency_names(cuda_dependency_libs)
+
+
+def _isa_dry_run_torch_lib_path() -> str:
+    from torch.utils.cpp_extension import TORCH_LIB_PATH
+
+    return TORCH_LIB_PATH
+
+
+def _isa_dry_run_extra_flags() -> tuple[str, ...]:
+    if sys.platform.startswith("linux"):
+        return ("-Wl,--as-needed",)
+    return ()
+
+
+def _use_linux_lightweight_isa_check() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def _isa_dry_run_env(torch_lib_path: str) -> dict[str, str]:
+    env = python_subprocess_env()
+
+    if _IS_WINDOWS:
+        _prepend_path_to_env(env, "PATH", torch_lib_path)
+    elif sys.platform == "darwin":
+        _prepend_path_to_env(env, "DYLD_LIBRARY_PATH", torch_lib_path)
+    else:
+        _prepend_path_to_env(env, "LD_LIBRARY_PATH", torch_lib_path)
+
+    return env
+
+
 def _get_isa_dry_compile_fingerprint(isa_flags: str) -> str:
     # ISA dry compile will cost about 1 sec time each startup time.
     # Please check the issue: https://github.com/pytorch/pytorch/issues/100378
@@ -30,10 +107,14 @@ def _get_isa_dry_compile_fingerprint(isa_flags: str) -> str:
     compiler_info = get_compiler_version_info(get_cpp_compiler())
     torch_version = torch.__version__
     fingerprint = f"{compiler_info}={isa_flags}={torch_version}"
+    if _use_linux_lightweight_isa_check():
+        fingerprint += "=linux_aot_no_torch_python_as_needed"
     return fingerprint
 
 
 class VecISA:
+    """Base vector ISA descriptor and dry-run validation helper."""
+
     _bit_width: int
     _macro: list[str]
     _arch_flags: str
@@ -72,8 +153,45 @@ extern "C" void __avx_chk_kernel() {
     _avx_py_load = """
 import torch
 from ctypes import cdll
-cdll.LoadLibrary("__lib_path__")
+cdll.LoadLibrary(__lib_path__)
 """
+
+    _avx_linux_py_load = """
+import ctypes
+
+_cuda_dependency_paths = __cuda_dependency_paths__
+_cuda_dependency_names = __cuda_dependency_names__
+
+def _preload_cuda_deps():
+    for _cuda_dependency_path in _cuda_dependency_paths:
+        ctypes.CDLL(_cuda_dependency_path)
+
+try:
+    ctypes.CDLL(__lib_path__)
+except OSError as _load_error:
+    if not any(_name in str(_load_error) for _name in _cuda_dependency_names):
+        raise
+    _preload_cuda_deps()
+    ctypes.CDLL(__lib_path__)
+"""
+
+    @staticmethod
+    def _import_torch_dry_run_load_script(output_path: str) -> str:
+        return VecISA._avx_py_load.replace("__lib_path__", json.dumps(output_path))
+
+    @staticmethod
+    def _linux_dry_run_load_script(
+        output_path: str,
+        cuda_dependency_paths: list[str],
+        cuda_dependency_names: list[str],
+    ) -> str:
+        return (
+            VecISA._avx_linux_py_load.replace(
+                "__cuda_dependency_paths__", json.dumps(cuda_dependency_paths)
+            )
+            .replace("__cuda_dependency_names__", json.dumps(cuda_dependency_names))
+            .replace("__lib_path__", json.dumps(output_path))
+        )
 
     def bit_width(self) -> int:
         return self._bit_width
@@ -109,11 +227,19 @@ cdll.LoadLibrary("__lib_path__")
         lock = FileLock(os.path.join(lock_dir, key + ".lock"), timeout=LOCK_TIMEOUT)
         with lock:
             output_dir = os.path.dirname(input_path)
-            buid_options = CppTorchOptions(vec_isa=self, warning_all=False)
+            build_option_kwargs: dict[str, Any] = {
+                "vec_isa": self,
+                "warning_all": False,
+            }
+            if _use_linux_lightweight_isa_check():
+                build_option_kwargs.update(
+                    aot_mode=True, extra_flags=_isa_dry_run_extra_flags()
+                )
+            build_options = CppTorchOptions(**build_option_kwargs)
             x86_isa_help_builder = CppBuilder(
                 key,
                 [input_path],
-                buid_options,
+                build_options,
                 output_dir,
             )
             try:
@@ -125,15 +251,26 @@ cdll.LoadLibrary("__lib_path__")
                     x86_isa_help_builder.build()
 
                 # Check build result
+                if _use_linux_lightweight_isa_check():
+                    torch_lib_path = _isa_dry_run_torch_lib_path()
+                    cuda_dependency_paths, cuda_dependency_names = (
+                        _isa_dry_run_cuda_dependency_paths()
+                    )
+                    load_script = VecISA._linux_dry_run_load_script(
+                        output_path,
+                        cuda_dependency_paths,
+                        cuda_dependency_names,
+                    )
+                    subprocess_env = _isa_dry_run_env(torch_lib_path)
+                else:
+                    load_script = VecISA._import_torch_dry_run_load_script(output_path)
+                    subprocess_env = python_subprocess_env()
+
                 subprocess.check_call(
-                    [
-                        sys.executable,
-                        "-c",
-                        VecISA._avx_py_load.replace("__lib_path__", output_path),
-                    ],
+                    [sys.executable, "-c", load_script],
                     cwd=output_dir,
                     stderr=subprocess.DEVNULL,
-                    env=python_subprocess_env(),
+                    env=subprocess_env,
                 )
             except Exception:
                 return False
