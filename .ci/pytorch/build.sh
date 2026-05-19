@@ -80,6 +80,23 @@ else
     export CMAKE_LIBRARY_PATH="/opt/conda/envs/py_$ANACONDA_PYTHON_VERSION/lib/"
     export CMAKE_INCLUDE_PATH="/opt/conda/envs/py_$ANACONDA_PYTHON_VERSION/include/"
   fi
+
+  # scikit-build-core's set_environment_for_gen() falls back to
+  # sysconfig.get_config_var("CC"/"CXX") when CC/CXX are unset; in conda envs
+  # that returns "gcc -pthread -B <prefix>/compiler_compat" (and similar for
+  # CXX). The compat linker's sysroot is older than modern libraries on the
+  # docker image, so CMake try_compile fails for any test that needs to link
+  # (FindBLAS check_function_exists(sgemm_) is the visible symptom; FindOpenMP
+  # also fails the same way). Export bare compilers so the sysconfig fallback
+  # is skipped.
+  if [[ -z "${CC:-}" ]]; then
+    CC=$(command -v gcc)
+    export CC
+  fi
+  if [[ -z "${CXX:-}" ]]; then
+    CXX=$(command -v g++)
+    export CXX
+  fi
 fi
 
 if [[ "$BUILD_ENVIRONMENT" == *aarch64* ]]; then
@@ -237,12 +254,6 @@ if [[ "$BUILD_ENVIRONMENT" != *rocm* && "$BUILD_ENVIRONMENT" != *s390x* && "$BUI
   git config --global --add safe.directory /var/lib/jenkins/workspace
 fi
 
-# check that setup.py would fail with bad arguments
-echo "The next three invocations are expected to fail with invalid command error messages."
-( ! get_exit_code python setup.py bad_argument )
-( ! get_exit_code python setup.py clean] )
-( ! get_exit_code python setup.py clean bad_argument )
-
 if [[ "$BUILD_ENVIRONMENT" != *libtorch* ]]; then
   # rocm builds fail when WERROR=1
   # XLA test build fails when WERROR=1
@@ -257,11 +268,8 @@ if [[ "$BUILD_ENVIRONMENT" != *libtorch* ]]; then
       python -mpip install numpy==2.0.2
     fi
 
-    WERROR=1 python setup.py clean
-
     WERROR=1 python -m build --wheel --no-isolation
   else
-    python setup.py clean
     if [[ "$BUILD_ENVIRONMENT" == *xla* ]]; then
       source .ci/pytorch/install_cache_xla.sh
     fi
