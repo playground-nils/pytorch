@@ -468,6 +468,11 @@ class ComboKernel(Kernel):
         self.num_warps = 8
         self.block_size_reduce = 256
         self.dynamic_shape_args: list[str] = []
+        self.standalone_autotune_seed_infos: list[tuple[str, list[Any], list[Any]]] = []
+        # (src_code, kernel, node_schedule) for each subkernel, populated by
+        # SIMDScheduling.generate_combo_kernel_code BEFORE process_kernel so the
+        # seed signature matches the combo subkernel's (incl. in_out_ptr0).
+        self.standalone_autotune_seed_kernels: list[tuple[str, Any, Any]] = []
 
     def create_sub_kernel(self, triton_kernel: TritonKernel) -> TritonKernel:
         sub_kernel = triton_kernel
@@ -796,6 +801,18 @@ class ComboKernel(Kernel):
                     filename=__file__,
                     triton_meta={triton_meta!r},
                     inductor_meta={inductor_meta!r},
+                )
+                @triton.jit
+            """
+        elif self.per_subkernel_blocks:
+            # Combo with per-subkernel tuning: use its own decorator.
+            # Each subkernel is tuned individually by a standalone seed
+            # kernel; the combo only needs a placeholder config + metadata.
+            heuristics_line = f"""
+                @triton_heuristics.combo_kernel(
+                    filename=__file__,
+                    triton_meta={triton_meta!r},
+                    inductor_meta={inductor_meta!r}
                 )
                 @triton.jit
             """
@@ -1155,6 +1172,63 @@ class ComboKernel(Kernel):
         if self.dynamic_shape_args:
             self.add_numel_to_call_args(name, call_args, arg_types)
 
+        triton_autotune_seed_infos = self.standalone_autotune_seed_infos
+        if self.standalone_autotune_seed_infos:
+            inplaced_call_arg_replacements: dict[str, str] = {}
+            seen_inplaced_args: OrderedSet[str] = OrderedSet()
+            for inplaced in self.args.inplace_buffers.values():
+                if isinstance(inplaced, RemovedArg):
+                    continue
+                if inplaced.inner_name in seen_inplaced_args:
+                    continue
+                seen_inplaced_args.add(inplaced.inner_name)
+                live_name = inplaced.other_names[-1]
+                for other_name in inplaced.other_names[:-1]:
+                    inplaced_call_arg_replacements[other_name] = live_name
+
+            seed_specs = []
+            triton_autotune_seed_infos = []
+            for (
+                seed_name,
+                seed_call_args,
+                seed_arg_types,
+            ) in self.standalone_autotune_seed_infos:
+                seed_call_args = [
+                    inplaced_call_arg_replacements.get(arg, arg)
+                    if isinstance(arg, str)
+                    else arg
+                    for arg in seed_call_args
+                ]
+                stale_args = [
+                    arg
+                    for arg in seed_call_args
+                    if isinstance(arg, str) and arg in V.graph.removed_buffers
+                ]
+                assert not stale_args, (
+                    f"Combo standalone autotune seed {seed_name} references "
+                    f"removed buffers {stale_args}"
+                )
+                triton_autotune_seed_infos.append(
+                    (seed_name, seed_call_args, seed_arg_types)
+                )
+                seed_args = wrapper.prepare_triton_kernel_call(seed_call_args)
+                if len(seed_args) == 1:
+                    seed_args_str = f"({seed_args[0]},)"
+                else:
+                    seed_args_str = f"({', '.join(seed_args)})"
+                seed_specs.append(f"({seed_name}, {seed_args_str})")
+            if seed_specs:
+                if len(seed_specs) == 1:
+                    seed_specs_str = f"({seed_specs[0]},)"
+                else:
+                    seed_specs_str = f"({', '.join(seed_specs)})"
+                # Emit into runtime call path (Python wrapper only).
+                # C++ wrappers can't call Python seed-bench functions.
+                if not V.graph.cpp_wrapper:
+                    wrapper.writeline(
+                        f"start_combo_kernel_standalone_autotune({name}, {seed_specs_str})"
+                    )
+
         wrapper.generate_kernel_call(
             name,
             call_args,
@@ -1162,6 +1236,7 @@ class ComboKernel(Kernel):
             arg_types=arg_types,
             triton_meta=self.triton_meta,
             inductor_meta=self.inductor_meta,
+            triton_autotune_seed_infos=triton_autotune_seed_infos,
         )
 
     def combo_grid_meta(self, size_hints_list: list[dict[str, int]]) -> dict[str, Any]:
@@ -1177,9 +1252,6 @@ class ComboKernel(Kernel):
         meta: dict[str, Any] = {
             "num_kernels": num_kernels,
             "min_blocks": min_blocks,
-            # Captured at codegen time so runtime sees the same value the
-            # source was generated with, regardless of later config changes.
-            "autotune_grouping": config.combo_kernel_autotune_grouping,
         }
 
         if not self.enable_autotune:
