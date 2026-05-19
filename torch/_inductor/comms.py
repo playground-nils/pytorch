@@ -2273,6 +2273,7 @@ def simple_overlap(snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 
         while _prev[coll] is not None:
             pred = _prev[coll]
+            assert pred is not None
             if outputs_of[pred] & coll_deps:
                 break
             if contains_async_collective(pred):
@@ -2302,6 +2303,7 @@ def simple_overlap(snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 
         while _next[wait] is not None:
             succ = _next[wait]
+            assert succ is not None
             if deps_of[succ] & wait_outs:
                 break
             if contains_wait(succ):
