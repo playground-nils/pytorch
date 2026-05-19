@@ -350,6 +350,7 @@ class FSDPParamGroup:
         )
 
     # Runtime #
+    @dist._spmd_no_typecheck()
     @_disable_functorch_if_active
     def unshard(self, async_op: bool = False):
         if self._all_gather_result is not None:  # already called, pending wait
@@ -395,6 +396,7 @@ class FSDPParamGroup:
                 self._all_gather_comm,
             )
 
+    @dist._spmd_no_typecheck()
     @_disable_functorch_if_active
     def wait_for_unshard(self):
         """
@@ -477,6 +479,7 @@ class FSDPParamGroup:
         if hasattr(self.comm_ctx, "all_gather_stream") and event is not None:
             self.comm_ctx.all_gather_stream.wait_event(event)
 
+    @dist._spmd_no_typecheck()
     @_disable_functorch_if_active
     def reshard(self):
         if self._training_state == TrainingState.FORWARD:
@@ -524,7 +527,7 @@ class FSDPParamGroup:
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         logger.debug("%s", self._with_fqn("FSDP::pre_forward"))
         with (
-            dist.spmd_no_typecheck(),
+            dist._spmd_no_typecheck(),
             record_function(self._with_fqn("FSDP::pre_forward")),
         ):
             # FORWARD at entry means another module in the grouped
@@ -542,7 +545,7 @@ class FSDPParamGroup:
     def post_forward(self, module: nn.Module, input: Any, output: Any):
         logger.debug("%s", self._with_fqn("FSDP::post_forward"))
         with (
-            dist.spmd_no_typecheck(),
+            dist._spmd_no_typecheck(),
             record_function(self._with_fqn("FSDP::post_forward")),
         ):
             # for AC(fully_shard(model)), AC runs fsdp's _pre_forward
@@ -566,7 +569,7 @@ class FSDPParamGroup:
             return
         logger.debug("%s", self._with_fqn("FSDP::pre_backward"))
         with (
-            dist.spmd_no_typecheck(),
+            dist._spmd_no_typecheck(),
             record_function(self._with_fqn("FSDP::pre_backward")),
         ):
             self._training_state = TrainingState.PRE_BACKWARD
@@ -576,7 +579,7 @@ class FSDPParamGroup:
                 self._backward_prefetch()
 
     @_dynamo_disable
-    @dist.spmd_no_typecheck()
+    @dist._spmd_no_typecheck()
     def post_backward(self, *unused: Any):
         # This method should be idempotent and safe to call even when this
         # FSDP parameter group was not used in backward (should be a no-op)
