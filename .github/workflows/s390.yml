@@ -1,20 +1,18 @@
 name: s390
-
-on:
+'on':
   push:
     tags:
-      - ciflow/s390/*
-  workflow_dispatch:
-
+    - ciflow/s390/*
+  workflow_dispatch: null
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_type == 'branch' && github.sha }}-${{ github.event_name == 'workflow_dispatch' }}-${{ github.event_name == 'schedule' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name
+    }}-${{ github.ref_type == 'branch' && github.sha }}-${{ github.event_name == 'workflow_dispatch'
+    }}-${{ github.event_name == 'schedule' }}
   cancel-in-progress: true
-
 permissions: read-all
-
 jobs:
   linux-manylinux-2_28-py3-cpu-s390x-build:
-    if: github.repository_owner == 'pytorch'
+    if: github.repository_owner == 'playground-nils'
     name: linux-manylinux-2_28-py3-cpu-s390x
     uses: ./.github/workflows/_linux-build.yml
     with:
