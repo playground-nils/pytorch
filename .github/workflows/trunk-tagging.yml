@@ -1,324 +1,155 @@
 name: trunk-tagging
-
-on:
+'on':
   push:
     branches:
-      - main
+    - main
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: 'Commit SHA to tag (leave empty for current HEAD)'
+        description: Commit SHA to tag (leave empty for current HEAD)
         required: false
         type: string
-
 concurrency:
   group: trunk-tagging-${{ github.event.inputs.commit_sha || github.sha }}
   cancel-in-progress: false
-
 permissions:
   contents: write
-
 jobs:
   tag-trunk-commit:
     name: Tag trunk commit
     runs-on: ubuntu-latest
-    if: github.repository_owner == 'pytorch'
-
+    if: github.repository_owner == 'playground-nils'
     steps:
-      - name: Pre-checkout validation
-        run: |
-          # For workflow_dispatch, validate SHA format before checkout
-          if [ -n "${INPUT_COMMIT_SHA}" ]; then
-            COMMIT_SHA="${INPUT_COMMIT_SHA}"
-
-            # Verify it's a well-formed SHA (40 hex characters)
-            if ! echo "${COMMIT_SHA}" | grep -qE '^[a-f0-9]{40}$'; then
-              echo "Error: Invalid commit SHA format. Expected 40 hexadecimal characters, got: ${COMMIT_SHA}"
-              exit 1
-            fi
-
-            echo "✅ Pre-checkout validation passed for: ${COMMIT_SHA}"
-          else
-            echo "✅ Using current commit SHA - no pre-checkout validation needed"
-          fi
-
-        env:
-          INPUT_COMMIT_SHA: ${{ github.event.inputs.commit_sha }}
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          # Fetch full history to ensure we have all commits
-          fetch-depth: 0
-          # For workflow_dispatch, checkout the specified commit
-          ref: ${{ github.event.inputs.commit_sha || github.sha }}
-
-      - name: Set commit SHA
-        id: commit
-        run: |
-          if [ -n "${INPUT_COMMIT_SHA}" ]; then
-            COMMIT_SHA="${INPUT_COMMIT_SHA}"
-          else
-            COMMIT_SHA="${{ github.sha }}"
-          fi
-          {
-            echo "sha=${COMMIT_SHA}"
-            echo "tag_name=trunk/${COMMIT_SHA}"
-          } >> "${GITHUB_OUTPUT}"
-
-        env:
-          INPUT_COMMIT_SHA: ${{ github.event.inputs.commit_sha }}
-      - name: Validate commit SHA
-        run: |
-          COMMIT_SHA="${{ steps.commit.outputs.sha }}"
-
-          # Verify the commit exists and is valid
-          if ! git cat-file -e "${COMMIT_SHA}"; then
-            echo "Error: Commit SHA ${COMMIT_SHA} does not exist in repository"
-            exit 1
-          fi
-
-          # For workflow_dispatch, verify the commit exists on main branch
-          if [ -n "${INPUT_COMMIT_SHA}" ]; then
-            echo "Manual dispatch detected - validating commit is on main branch..."
-
-            # Get all commits reachable from main branch
-            if ! git merge-base --is-ancestor "${COMMIT_SHA}" origin/main; then
-              echo "Error: Commit ${COMMIT_SHA} is not reachable from main branch"
-              echo "Only commits that exist on the main branch can be tagged"
-              exit 1
-            fi
-
-            echo "✅ Commit ${COMMIT_SHA} is valid and exists on main branch"
-          else
-            echo "✅ Commit ${COMMIT_SHA} is valid (automatic push trigger)"
-          fi
-
-        env:
-          INPUT_COMMIT_SHA: ${{ github.event.inputs.commit_sha }}
-      - name: Create and push tag(s) with retry
-        id: check_tag
-        env:
-          TAG_NAME: ${{ steps.commit.outputs.tag_name }}
-          COMMIT_SHA: ${{ steps.commit.outputs.sha }}
-        run: |
-          set -e
-
-          # Check if tag already exists
-          check_tag_exists() {
-            # Check if tag exists locally
-            if git tag -l "${TAG_NAME}" | grep -q "${TAG_NAME}"; then
-              echo "Tag ${TAG_NAME} already exists locally"
-              return 0
-            fi
-
-            # Check if tag exists on remote
-            if git ls-remote --tags origin "${TAG_NAME}" | grep -q "${TAG_NAME}"; then
-              echo "Tag ${TAG_NAME} already exists on remote"
-              return 0
-            fi
-
-            return 1
-          }
-
-          # Counters for summary reporting
-          created_count=0
-          skipped_count=0
-          failed_count=0
-
-          # Always write outputs once on exit
-          finish() {
-            set +e
-            if [ -n "${GITHUB_OUTPUT:-}" ]; then
-              {
-                echo "created_count=${created_count}"
-                echo "skipped_count=${skipped_count}"
-                echo "failed_count=${failed_count}"
-              } >> "${GITHUB_OUTPUT}"
-            fi
-          }
-          trap finish EXIT
-
-          # Retry configuration
-          MAX_RETRIES=5
-          BASE_DELAY=2
-          BACKOFF_MULTIPLIER=4
-          MAX_DELAY=3600
-
-          # Common retry function with exponential backoff
-          retry_with_backoff() {
-            local command="${1}"
-            local description="${2}"
-            local retry_count=0
-
-            while [ "${retry_count}" -le "${MAX_RETRIES}" ]; do
-              echo "Attempt $((retry_count + 1))/$((MAX_RETRIES + 1)): ${description}"
-
-              if eval "${command}"; then
-                echo "Success on attempt $((retry_count + 1))"
-                return 0
-              fi
-
-              retry_count=$((retry_count + 1))
-
-              if [ "${retry_count}" -le "${MAX_RETRIES}" ]; then
-                # Calculate delay with exponential backoff
-                local delay=$((BASE_DELAY * (BACKOFF_MULTIPLIER ** retry_count)))
-                if [ "${delay}" -gt "${MAX_DELAY}" ]; then
-                  delay="${MAX_DELAY}"
-                fi
-
-                echo "Failed. Retrying in ${delay} seconds..."
-                sleep "${delay}"
-              fi
-            done
-
-            echo "All retry attempts exhausted"
-            return 1
-          }
-
-          # Function to create and push tag
-          create_and_push_tag() {
-            # Create the tag
-            if ! git tag "${TAG_NAME}" "${COMMIT_SHA}"; then
-              echo "Failed to create local tag"
-              return 1
-            fi
-
-            # Push the tag
-            if git push origin "${TAG_NAME}"; then
-              echo "Successfully created and pushed tag ${TAG_NAME}"
-              return 0
-            else
-              echo "Failed to push tag to remote"
-              # Clean up local tag for retry
-              git tag -d "${TAG_NAME}" 2>/dev/null || true
-              return 1
-            fi
-          }
-
-          # Function to handle retries with race condition checks
-          tag_with_retry() {
-            # Check if tag exists before attempting creation
-            if check_tag_exists; then
-              echo "Tag ${TAG_NAME} was created by another process, exiting successfully"
-              return 0
-            fi
-
-            create_and_push_tag || {
-              # Fetch latest state for next retry
-              git fetch origin --tags
-              return 1
-            }
-          }
-
-          # New behavior for push events: enumerate commits in the push and tag each one.
-          # For workflow_dispatch, retain existing single-SHA behavior.
-
-          # Always fetch tags once up front to improve idempotency in loops
-          git fetch origin --tags --quiet || true
-
-          if [ "${{ github.event_name }}" = "push" ]; then
-            BEFORE_SHA="${{ github.event.before }}"
-            AFTER_SHA="${{ github.sha }}"  # same as event.after
-
-            # List commits introduced by this push (old..new), oldest first for stable ordering
-            commits_file="$(mktemp)"
-            git rev-list --reverse "${BEFORE_SHA}..${AFTER_SHA}" > "${commits_file}"
-
-            if [ ! -s "${commits_file}" ]; then
-              echo "No new commits found between ${BEFORE_SHA}..${AFTER_SHA}; nothing to tag."
-              rm -f "${commits_file}"
-              exit 0
-            fi
-
-            commit_count="$(wc -l < "${commits_file}" | tr -d ' ')"
-            echo "Found ${commit_count} commit(s) to tag for push:"
-            while IFS= read -r sha; do
-              printf '  %s\n' "${sha}"
-            done < "${commits_file}"
-
-            while IFS= read -r sha; do
-              TAG_NAME="trunk/${sha}"
-              COMMIT_SHA="${sha}"
-
-              # If tag already exists locally or remotely, skip (idempotent)
-              if check_tag_exists; then
-                echo "✅ Tag ${TAG_NAME} already exists - skipping"
-                skipped_count=$((skipped_count + 1))
-                continue
-              fi
-
-              echo "Tag ${TAG_NAME} does not exist, proceeding with creation"
-
-              if retry_with_backoff "tag_with_retry" "Creating tag ${TAG_NAME} for commit ${COMMIT_SHA}"; then
-                created_count=$((created_count + 1))
-              else
-                echo "Tag creation failed after all retry attempts for ${TAG_NAME}"
-                failed_count=$((failed_count + 1))
-              fi
-            done < "${commits_file}"
-
-            rm -f "${commits_file}"
-
-            if [ "${failed_count}" -gt 0 ]; then
-              exit 1
-            fi
-            exit 0
-          else
-            # workflow_dispatch path (single SHA tagging preserved)
-
-            # Exit early if tag already exists
-            if check_tag_exists; then
-              echo "✅ Tag already exists - no action needed"
-              skipped_count=1
-              exit 0
-            fi
-
-            echo "Tag ${TAG_NAME} does not exist, proceeding with creation"
-
-            if retry_with_backoff "tag_with_retry" "Creating tag ${TAG_NAME} for commit ${COMMIT_SHA}"; then
-              created_count=1
-              exit 0
-            else
-              echo "Tag creation failed after all retry attempts"
-              failed_count=1
-              exit 1
-            fi
-          fi
-
-      - name: Tag creation summary
-        if: always()
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "Trigger: push on main"
-            echo "Created: ${{ steps.check_tag.outputs.created_count }}"
-            echo "Skipped (already existed): ${{ steps.check_tag.outputs.skipped_count }}"
-            echo "Failed: ${{ steps.check_tag.outputs.failed_count }}"
-            if [ "${{ steps.check_tag.outputs.failed_count }}" = "0" ]; then
-              echo "✅ Completed tagging for push range ${{ github.event.before }}..${{ github.sha }}"
-            else
-              echo "❌ Some tags failed to create for push range ${{ github.event.before }}..${{ github.sha }}"
-            fi
-          else
-            if [ "${{ steps.check_tag.outputs.failed_count }}" = "0" ]; then
-              if [ "${{ steps.check_tag.outputs.created_count }}" = "0" ]; then
-                echo "✅ Tag ${{ steps.commit.outputs.tag_name }} already existed - no action needed"
-              else
-                echo "✅ Successfully created tag ${{ steps.commit.outputs.tag_name }} for commit ${{ steps.commit.outputs.sha }}"
-              fi
-            else
-              echo "❌ Failed to create tag ${{ steps.commit.outputs.tag_name }} for commit ${{ steps.commit.outputs.sha }}"
-            fi
-
-            echo ""
-            echo "Tag details:"
-            echo "  Name: ${{ steps.commit.outputs.tag_name }}"
-            echo "  Commit: ${{ steps.commit.outputs.sha }}"
-            echo "  Trigger: ${{ github.event_name }}"
-            if [ -n "${INPUT_COMMIT_SHA}" ]; then
-              echo "  Manual commit: ${INPUT_COMMIT_SHA}"
-            fi
-          fi
-
-        env:
-          INPUT_COMMIT_SHA: ${{ github.event.inputs.commit_sha }}
+    - name: Pre-checkout validation
+      run: "# For workflow_dispatch, validate SHA format before checkout\nif [ -n\
+        \ \"${INPUT_COMMIT_SHA}\" ]; then\n  COMMIT_SHA=\"${INPUT_COMMIT_SHA}\"\n\n\
+        \  # Verify it's a well-formed SHA (40 hex characters)\n  if ! echo \"${COMMIT_SHA}\"\
+        \ | grep -qE '^[a-f0-9]{40}$'; then\n    echo \"Error: Invalid commit SHA\
+        \ format. Expected 40 hexadecimal characters, got: ${COMMIT_SHA}\"\n    exit\
+        \ 1\n  fi\n\n  echo \"\u2705 Pre-checkout validation passed for: ${COMMIT_SHA}\"\
+        \nelse\n  echo \"\u2705 Using current commit SHA - no pre-checkout validation\
+        \ needed\"\nfi\n"
+      env:
+        INPUT_COMMIT_SHA: ${{ github.event.inputs.commit_sha }}
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ github.event.inputs.commit_sha || github.sha }}
+    - name: Set commit SHA
+      id: commit
+      run: "if [ -n \"${INPUT_COMMIT_SHA}\" ]; then\n  COMMIT_SHA=\"${INPUT_COMMIT_SHA}\"\
+        \nelse\n  COMMIT_SHA=\"${{ github.sha }}\"\nfi\n{\n  echo \"sha=${COMMIT_SHA}\"\
+        \n  echo \"tag_name=trunk/${COMMIT_SHA}\"\n} >> \"${GITHUB_OUTPUT}\"\n"
+      env:
+        INPUT_COMMIT_SHA: ${{ github.event.inputs.commit_sha }}
+    - name: Validate commit SHA
+      run: "COMMIT_SHA=\"${{ steps.commit.outputs.sha }}\"\n\n# Verify the commit\
+        \ exists and is valid\nif ! git cat-file -e \"${COMMIT_SHA}\"; then\n  echo\
+        \ \"Error: Commit SHA ${COMMIT_SHA} does not exist in repository\"\n  exit\
+        \ 1\nfi\n\n# For workflow_dispatch, verify the commit exists on main branch\n\
+        if [ -n \"${INPUT_COMMIT_SHA}\" ]; then\n  echo \"Manual dispatch detected\
+        \ - validating commit is on main branch...\"\n\n  # Get all commits reachable\
+        \ from main branch\n  if ! git merge-base --is-ancestor \"${COMMIT_SHA}\"\
+        \ origin/main; then\n    echo \"Error: Commit ${COMMIT_SHA} is not reachable\
+        \ from main branch\"\n    echo \"Only commits that exist on the main branch\
+        \ can be tagged\"\n    exit 1\n  fi\n\n  echo \"\u2705 Commit ${COMMIT_SHA}\
+        \ is valid and exists on main branch\"\nelse\n  echo \"\u2705 Commit ${COMMIT_SHA}\
+        \ is valid (automatic push trigger)\"\nfi\n"
+      env:
+        INPUT_COMMIT_SHA: ${{ github.event.inputs.commit_sha }}
+    - name: Create and push tag(s) with retry
+      id: check_tag
+      env:
+        TAG_NAME: ${{ steps.commit.outputs.tag_name }}
+        COMMIT_SHA: ${{ steps.commit.outputs.sha }}
+      run: "set -e\n\n# Check if tag already exists\ncheck_tag_exists() {\n  # Check\
+        \ if tag exists locally\n  if git tag -l \"${TAG_NAME}\" | grep -q \"${TAG_NAME}\"\
+        ; then\n    echo \"Tag ${TAG_NAME} already exists locally\"\n    return 0\n\
+        \  fi\n\n  # Check if tag exists on remote\n  if git ls-remote --tags origin\
+        \ \"${TAG_NAME}\" | grep -q \"${TAG_NAME}\"; then\n    echo \"Tag ${TAG_NAME}\
+        \ already exists on remote\"\n    return 0\n  fi\n\n  return 1\n}\n\n# Counters\
+        \ for summary reporting\ncreated_count=0\nskipped_count=0\nfailed_count=0\n\
+        \n# Always write outputs once on exit\nfinish() {\n  set +e\n  if [ -n \"\
+        ${GITHUB_OUTPUT:-}\" ]; then\n    {\n      echo \"created_count=${created_count}\"\
+        \n      echo \"skipped_count=${skipped_count}\"\n      echo \"failed_count=${failed_count}\"\
+        \n    } >> \"${GITHUB_OUTPUT}\"\n  fi\n}\ntrap finish EXIT\n\n# Retry configuration\n\
+        MAX_RETRIES=5\nBASE_DELAY=2\nBACKOFF_MULTIPLIER=4\nMAX_DELAY=3600\n\n# Common\
+        \ retry function with exponential backoff\nretry_with_backoff() {\n  local\
+        \ command=\"${1}\"\n  local description=\"${2}\"\n  local retry_count=0\n\n\
+        \  while [ \"${retry_count}\" -le \"${MAX_RETRIES}\" ]; do\n    echo \"Attempt\
+        \ $((retry_count + 1))/$((MAX_RETRIES + 1)): ${description}\"\n\n    if eval\
+        \ \"${command}\"; then\n      echo \"Success on attempt $((retry_count + 1))\"\
+        \n      return 0\n    fi\n\n    retry_count=$((retry_count + 1))\n\n    if\
+        \ [ \"${retry_count}\" -le \"${MAX_RETRIES}\" ]; then\n      # Calculate delay\
+        \ with exponential backoff\n      local delay=$((BASE_DELAY * (BACKOFF_MULTIPLIER\
+        \ ** retry_count)))\n      if [ \"${delay}\" -gt \"${MAX_DELAY}\" ]; then\n\
+        \        delay=\"${MAX_DELAY}\"\n      fi\n\n      echo \"Failed. Retrying\
+        \ in ${delay} seconds...\"\n      sleep \"${delay}\"\n    fi\n  done\n\n \
+        \ echo \"All retry attempts exhausted\"\n  return 1\n}\n\n# Function to create\
+        \ and push tag\ncreate_and_push_tag() {\n  # Create the tag\n  if ! git tag\
+        \ \"${TAG_NAME}\" \"${COMMIT_SHA}\"; then\n    echo \"Failed to create local\
+        \ tag\"\n    return 1\n  fi\n\n  # Push the tag\n  if git push origin \"${TAG_NAME}\"\
+        ; then\n    echo \"Successfully created and pushed tag ${TAG_NAME}\"\n   \
+        \ return 0\n  else\n    echo \"Failed to push tag to remote\"\n    # Clean\
+        \ up local tag for retry\n    git tag -d \"${TAG_NAME}\" 2>/dev/null || true\n\
+        \    return 1\n  fi\n}\n\n# Function to handle retries with race condition\
+        \ checks\ntag_with_retry() {\n  # Check if tag exists before attempting creation\n\
+        \  if check_tag_exists; then\n    echo \"Tag ${TAG_NAME} was created by another\
+        \ process, exiting successfully\"\n    return 0\n  fi\n\n  create_and_push_tag\
+        \ || {\n    # Fetch latest state for next retry\n    git fetch origin --tags\n\
+        \    return 1\n  }\n}\n\n# New behavior for push events: enumerate commits\
+        \ in the push and tag each one.\n# For workflow_dispatch, retain existing\
+        \ single-SHA behavior.\n\n# Always fetch tags once up front to improve idempotency\
+        \ in loops\ngit fetch origin --tags --quiet || true\n\nif [ \"${{ github.event_name\
+        \ }}\" = \"push\" ]; then\n  BEFORE_SHA=\"${{ github.event.before }}\"\n \
+        \ AFTER_SHA=\"${{ github.sha }}\"  # same as event.after\n\n  # List commits\
+        \ introduced by this push (old..new), oldest first for stable ordering\n \
+        \ commits_file=\"$(mktemp)\"\n  git rev-list --reverse \"${BEFORE_SHA}..${AFTER_SHA}\"\
+        \ > \"${commits_file}\"\n\n  if [ ! -s \"${commits_file}\" ]; then\n    echo\
+        \ \"No new commits found between ${BEFORE_SHA}..${AFTER_SHA}; nothing to tag.\"\
+        \n    rm -f \"${commits_file}\"\n    exit 0\n  fi\n\n  commit_count=\"$(wc\
+        \ -l < \"${commits_file}\" | tr -d ' ')\"\n  echo \"Found ${commit_count}\
+        \ commit(s) to tag for push:\"\n  while IFS= read -r sha; do\n    printf '\
+        \  %s\\n' \"${sha}\"\n  done < \"${commits_file}\"\n\n  while IFS= read -r\
+        \ sha; do\n    TAG_NAME=\"trunk/${sha}\"\n    COMMIT_SHA=\"${sha}\"\n\n  \
+        \  # If tag already exists locally or remotely, skip (idempotent)\n    if\
+        \ check_tag_exists; then\n      echo \"\u2705 Tag ${TAG_NAME} already exists\
+        \ - skipping\"\n      skipped_count=$((skipped_count + 1))\n      continue\n\
+        \    fi\n\n    echo \"Tag ${TAG_NAME} does not exist, proceeding with creation\"\
+        \n\n    if retry_with_backoff \"tag_with_retry\" \"Creating tag ${TAG_NAME}\
+        \ for commit ${COMMIT_SHA}\"; then\n      created_count=$((created_count +\
+        \ 1))\n    else\n      echo \"Tag creation failed after all retry attempts\
+        \ for ${TAG_NAME}\"\n      failed_count=$((failed_count + 1))\n    fi\n  done\
+        \ < \"${commits_file}\"\n\n  rm -f \"${commits_file}\"\n\n  if [ \"${failed_count}\"\
+        \ -gt 0 ]; then\n    exit 1\n  fi\n  exit 0\nelse\n  # workflow_dispatch path\
+        \ (single SHA tagging preserved)\n\n  # Exit early if tag already exists\n\
+        \  if check_tag_exists; then\n    echo \"\u2705 Tag already exists - no action\
+        \ needed\"\n    skipped_count=1\n    exit 0\n  fi\n\n  echo \"Tag ${TAG_NAME}\
+        \ does not exist, proceeding with creation\"\n\n  if retry_with_backoff \"\
+        tag_with_retry\" \"Creating tag ${TAG_NAME} for commit ${COMMIT_SHA}\"; then\n\
+        \    created_count=1\n    exit 0\n  else\n    echo \"Tag creation failed after\
+        \ all retry attempts\"\n    failed_count=1\n    exit 1\n  fi\nfi\n"
+    - name: Tag creation summary
+      if: always()
+      run: "if [ \"${{ github.event_name }}\" = \"push\" ]; then\n  echo \"Trigger:\
+        \ push on main\"\n  echo \"Created: ${{ steps.check_tag.outputs.created_count\
+        \ }}\"\n  echo \"Skipped (already existed): ${{ steps.check_tag.outputs.skipped_count\
+        \ }}\"\n  echo \"Failed: ${{ steps.check_tag.outputs.failed_count }}\"\n \
+        \ if [ \"${{ steps.check_tag.outputs.failed_count }}\" = \"0\" ]; then\n \
+        \   echo \"\u2705 Completed tagging for push range ${{ github.event.before\
+        \ }}..${{ github.sha }}\"\n  else\n    echo \"\u274C Some tags failed to create\
+        \ for push range ${{ github.event.before }}..${{ github.sha }}\"\n  fi\nelse\n\
+        \  if [ \"${{ steps.check_tag.outputs.failed_count }}\" = \"0\" ]; then\n\
+        \    if [ \"${{ steps.check_tag.outputs.created_count }}\" = \"0\" ]; then\n\
+        \      echo \"\u2705 Tag ${{ steps.commit.outputs.tag_name }} already existed\
+        \ - no action needed\"\n    else\n      echo \"\u2705 Successfully created\
+        \ tag ${{ steps.commit.outputs.tag_name }} for commit ${{ steps.commit.outputs.sha\
+        \ }}\"\n    fi\n  else\n    echo \"\u274C Failed to create tag ${{ steps.commit.outputs.tag_name\
+        \ }} for commit ${{ steps.commit.outputs.sha }}\"\n  fi\n\n  echo \"\"\n \
+        \ echo \"Tag details:\"\n  echo \"  Name: ${{ steps.commit.outputs.tag_name\
+        \ }}\"\n  echo \"  Commit: ${{ steps.commit.outputs.sha }}\"\n  echo \"  Trigger:\
+        \ ${{ github.event_name }}\"\n  if [ -n \"${INPUT_COMMIT_SHA}\" ]; then\n\
+        \    echo \"  Manual commit: ${INPUT_COMMIT_SHA}\"\n  fi\nfi\n"
+      env:
+        INPUT_COMMIT_SHA: ${{ github.event.inputs.commit_sha }}
