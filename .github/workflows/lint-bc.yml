@@ -1,33 +1,32 @@
 name: BC Lint
-
-on:
+'on':
   pull_request:
     types:
-      - opened
-      - synchronize
-      - reopened
+    - opened
+    - synchronize
+    - reopened
     branches-ignore:
-      - nightly
+    - nightly
   push:
     tags:
-      # TODO: Remove me later
-      -  ciflow/inductor-cu126/*
-  workflow_dispatch:
-
+    - ciflow/inductor-cu126/*
+  workflow_dispatch: null
 jobs:
   bc_linter:
-    if: github.repository_owner == 'pytorch'
+    if: github.repository_owner == 'playground-nils'
     runs-on: ubuntu-latest
     steps:
-      - name: Run BC Lint Action
-        uses: pytorch/test-infra/.github/actions/bc-lint@main
-        with:
-          repo: ${{ github.event.pull_request.head.repo.full_name }}
-          base_sha: ${{ github.event.pull_request.base.sha }}
-          head_sha: ${{ github.event.pull_request.head.sha }}
-          suppression: ${{ contains(github.event.pull_request.labels.*.name, 'suppress-api-compatibility-check') || contains(github.event.pull_request.labels.*.name, 'suppress-bc-linter') }}
-          docs_link: 'https://github.com/pytorch/test-infra/wiki/BC-Linter'
-
+    - name: Run BC Lint Action
+      uses: pytorch/test-infra/.github/actions/bc-lint@main
+      with:
+        repo: ${{ github.event.pull_request.head.repo.full_name }}
+        base_sha: ${{ github.event.pull_request.base.sha }}
+        head_sha: ${{ github.event.pull_request.head.sha }}
+        suppression: ${{ contains(github.event.pull_request.labels.*.name, 'suppress-api-compatibility-check')
+          || contains(github.event.pull_request.labels.*.name, 'suppress-bc-linter')
+          }}
+        docs_link: https://github.com/pytorch/test-infra/wiki/BC-Linter
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha
+    }}-${{ github.event_name == 'workflow_dispatch' }}
   cancel-in-progress: true
